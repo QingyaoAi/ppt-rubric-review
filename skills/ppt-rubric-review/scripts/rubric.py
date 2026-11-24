@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Zero-dependency CLI for Handmade PPT Rubric v2.2.
+"""Zero-dependency CLI for Handmade PPT Rubric v2.3.
 
 Subcommands:
   guide   Print rubric criteria, anchors, vetoes, signals, and tier thresholds
-  scan    Forensic XML/ZIP pre-scan of a .pptx for S1-S11 signals (including
-          non-human URLs/hyperlinks, internal-draft citations, defensive notes),
+  scan    Forensic XML/ZIP pre-scan of a .pptx for S1-S12 signals (including
+          non-human URLs/hyperlinks, internal-draft citations, defensive notes,
+          stiff AI coinages & over-compressed phrasing),
           placeholders, verbatim repetition, leaked AI meta-text, and sampling plan
-  init    Create a blank evidence-backed v2.2 review JSON (auto-activates H1-H9)
+  init    Create a blank evidence-backed v2.3 review JSON (auto-activates H1-H9)
   score   Validate and score a review JSON (Total, Anti-AI, A-H dims, S-D tier, fix_queue)
   diff    Compare two review rounds (deltas in Total, Anti-AI, vetoes, red flags, items)
 """
@@ -24,7 +25,7 @@ import sys
 from xml.etree import ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-RUBRIC_JSON = Path(__file__).resolve().parents[1] / "references" / "rubric-v2.2.json"
+RUBRIC_JSON = Path(__file__).resolve().parents[1] / "references" / "rubric-v2.3.json"
 NA = "不适用"
 
 NS = {
@@ -127,11 +128,59 @@ VAGUE_SOURCE_STAMP_RX = re.compile(
     re.IGNORECASE,
 )
 
+# S12: Stiff AI coinages, over-compressed jargon & bureaucratic/internet filler terms
+STIFF_COINAGE_PATTERNS = [
+    "竞合窗口",
+    "先发窗口",
+    "领跑势能",
+    "先发势能",
+    "战略势能",
+    "增长势能",
+    "固化势能",
+    "硬任务已压实",
+    "压实硬任务",
+    "制度接口",
+    "共享基座",
+    "数智底座",
+    "底层逻辑重塑",
+    "范式跃迁",
+    "价值跃升",
+    "能力跃迁",
+    "体系化跃升",
+    "战略卡位",
+    "生态卡位",
+    "战略抓手",
+    "核心抓手",
+    "重要抓手",
+    "队伍底盘",
+    "业务底盘",
+    "治理场域",
+    "前置化解",
+    "精准滴灌",
+    "靶向发力",
+    "同频共振",
+    "双向奔赴",
+    "深度耦合",
+    "多维穿透",
+    "全要素联动",
+    "跨模融通",
+    "算网智融",
+    "数智贯通",
+    "单点破局",
+    "任务颗粒度",
+]
+
+# Detect overly long unbroken Chinese modifier chains (3+ stacked '的' or 20+ chars before '的/下/中')
+LONG_MODIFIER_RX = re.compile(
+    r"(?:[\u4e00-\u9fff]{2,6}的){3,}[\u4e00-\u9fff]{2,6}"
+    r"|面向[\u4e00-\u9fff、/·]{14,}的[\u4e00-\u9fff]{2,8}"
+)
+
 
 def load_rubric(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("version") != "v2.2":
-        raise ValueError("仅支持 v2.2 JSON 量表（references/rubric-v2.2.json）。")
+    if data.get("version") not in ("v2.2", "v2.3"):
+        raise ValueError("仅支持 v2.3（及兼容 v2.2）JSON 量表（references/rubric-v2.3.json）。")
     return data
 
 
@@ -182,7 +231,7 @@ def cmd_guide(rubric: dict, genre: str | None, fmt: str) -> str:
         f"# {rubric['title']}",
         "",
         f"- 默认修订目标分：**{rubric['default_target']}**（S 级门槛：整体 ≥88 且去 AI 味 ≥85，0 否决，0 红灯，0 整稿零分，含 0 分页 ≤10%）",
-        "- 核心制作底线（P1–P6）：" + "；".join(f"{p['id']} {p['rule']}" for p in guides),
+        "- 核心制作底线（P1–P7）：" + "；".join(f"{p['id']} {p['rule']}" for p in guides),
         "",
         "## 一、交付否决项（V1–V4，命中任一即 D 级阻断）",
     ]
@@ -190,7 +239,7 @@ def cmd_guide(rubric: dict, genre: str | None, fmt: str) -> str:
         lines.append(f"- **{vid} {v['title']}**：{v['condition']}")
 
     lines.append("")
-    lines.append("## 二、AI 味与工序风险指纹（S1–S11，0 无 / 1 轻度 / 2 显著红灯）")
+    lines.append("## 二、AI 味与工序风险指纹（S1–S12，0 无 / 1 轻度 / 2 显著红灯）")
     for sid, s in rubric["signals"].items():
         tag = "工序" if s["category"] == "process" else "AI味"
         lines.append(f"- **{sid} [{tag}] {s['title']}**：{s['criteria']}")
@@ -332,6 +381,8 @@ def scan_pptx(pptx_path: Path) -> dict:
         dense_slides = []
         meta_leaks = []
         buzzword_hits = []
+        stiff_coinage_hits = []
+        long_modifier_hits = []
         unhuman_url_hits = []
         internal_cite_hits = []
         defensive_note_hits = []
@@ -471,10 +522,15 @@ def scan_pptx(pptx_path: Path) -> dict:
             if any(p.strip() in ("……", "...", "——") for p in paras):
                 meta_leaks.append({"slide": idx, "match": "standalone_ellipsis_placeholder"})
 
-            # Buzzwords
+            # Buzzwords & S12 stiff AI coinages / long modifier chains
             for bw in BUZZWORD_PATTERNS:
                 if bw in body_text:
                     buzzword_hits.append({"slide": idx, "term": bw})
+            for sc in STIFF_COINAGE_PATTERNS:
+                if sc in body_text:
+                    stiff_coinage_hits.append({"slide": idx, "term": sc})
+            for m in LONG_MODIFIER_RX.finditer(body_text):
+                long_modifier_hits.append({"slide": idx, "match": m.group(0)[:50]})
 
             # S11: Non-human URLs/syntax, internal-file citations, defensive notes, vague source stamps
             for m in UNHUMAN_URL_RX.finditer(body_text):
@@ -567,6 +623,11 @@ def scan_pptx(pptx_path: Path) -> dict:
         )
         else (1 if (s11_total >= 1 or (vague_stamp_pct >= 25.0 and len(vague_source_stamp_slides) >= 3)) else 0)
     )
+    s_hints["S12"] = (
+        2
+        if (len(stiff_coinage_hits) >= 4 or (len(stiff_coinage_hits) >= 2 and len(long_modifier_hits) >= 2))
+        else (1 if (len(stiff_coinage_hits) >= 1 or len(long_modifier_hits) >= 2) else 0)
+    )
 
     # Stratified sampling recommendation
     if total <= 35:
@@ -586,7 +647,7 @@ def scan_pptx(pptx_path: Path) -> dict:
         sample_slides = sorted(picks)[:12]
 
     s1_6_red_hint = sum(1 for k in ("S1", "S2", "S3", "S4", "S5", "S6") if s_hints[k] == 2)
-    s7_11_red_hint = sum(1 for k in ("S7", "S8", "S9", "S10", "S11") if s_hints[k] == 2)
+    s7_12_red_hint = sum(1 for k in ("S7", "S8", "S9", "S10", "S11", "S12") if s_hints[k] == 2)
 
     return {
         "file": str(pptx_path),
@@ -617,7 +678,7 @@ def scan_pptx(pptx_path: Path) -> dict:
         "signal_hints": s_hints,
         "risk_summary": {
             "s1_6_process_red_hints": s1_6_red_hint,
-            "s7_11_ai_flavor_red_hints": s7_11_red_hint,
+            "s7_12_ai_flavor_red_hints": s7_12_red_hint,
             "v4_process_warning": s1_6_red_hint >= 2,
             "zero_period_warning": cn_period_per_1k == 0.0,
             "robotic_period_warning": (cn_period_per_1k is not None and cn_period_per_1k >= 25.0),
@@ -625,6 +686,8 @@ def scan_pptx(pptx_path: Path) -> dict:
         "findings": {
             "meta_leaks_or_placeholders": meta_leaks[:20],
             "buzzword_hits": buzzword_hits[:15],
+            "stiff_coinage_hits": stiff_coinage_hits[:25],
+            "long_modifier_hits": long_modifier_hits[:15],
             "unhuman_urls_or_syntax": unhuman_url_hits[:15],
             "internal_workflow_citations": internal_cite_hits[:15],
             "defensive_meta_notes": defensive_note_hits[:15],
@@ -649,11 +712,11 @@ def format_scan_summary(res: dict) -> str:
     rs = res["risk_summary"]
     f = res["findings"]
     lines = [
-        f"=== PPTX 客观预检报告（v2.2）：{Path(res['file']).name} ===",
+        f"=== PPTX 客观预检报告（v2.3）：{Path(res['file']).name} ===",
         f"总页数：{res['total_slides']}（隐藏页：{len(res['hidden_slides'])}）| 独立图片媒体：{m['unique_image_media']}（非底图：{m['non_bg_image_media']}）",
         f"工序指标：满版单底图 {m['top_fullbleed_bg_pct']}% | Blank {m['blank_layout_pct']}% / 标题占位符 {m['title_placeholder_pct']}% | 四分点字号 {m['quarter_pt_font_pct']}% | 备注/正文 {m['notes_body_ratio']}x | 手打错页码 {len(f['hand_pagenum_mismatches'])}页 | 备注[Sxx] {m['notes_cite_tags']} vs 页面 {m['slide_cite_tags']}",
-        f"AI味指标：底栏重复 {m['bottom_bar_pct']}% | 大表占比 {m['large_table_pct']}% | 原生柱图占比 {m['native_chart_pct']}% | 中文句号密度 {m['cn_period_per_1k_cjk']}‰ | <10pt碎字 {m['tiny_font_under_10pt_pct']}% | 笼统出处盖章 {m['vague_source_stamp_pct']}%",
-        "预判红灯提示（须结合视觉渲染终审）："
+        f"AI味指标：底栏重复 {m['bottom_bar_pct']}% | 大表占比 {m['large_table_pct']}% | 原生柱图占比 {m['native_chart_pct']}% | 中文句号密度 {m['cn_period_per_1k_cjk']}‰ | <10pt碎字 {m['tiny_font_under_10pt_pct']}% | 笼统出处盖章 {m['vague_source_stamp_pct']}% | 生造黑话 {len(f['stiff_coinage_hits'])}处",
+        "预判红灯提示（须结合视觉渲染与逐页默读终审）："
         + " ".join(f"{k}={v}" for k, v in sh.items()),
     ]
     if rs["v4_process_warning"]:
@@ -662,6 +725,12 @@ def format_scan_summary(res: dict) -> str:
         lines.append("⚠ [D2 预警] 中文正文 0 句号，疑似文档切页碎词堆砌！")
     if rs["robotic_period_warning"]:
         lines.append("⚠ [D2 预警] 中文句号密度 >=25‰，疑似机械句号迎合腔！")
+    if f["stiff_coinage_hits"]:
+        sample_sc = ", ".join(f"p{x['slide']}:{x['term']}" for x in f["stiff_coinage_hits"][:10])
+        lines.append(f"⚠ [S12/D2 生造黑话/晦涩词预警] ({len(f['stiff_coinage_hits'])}处)：{sample_sc}")
+    if f["long_modifier_hits"]:
+        sample_lm = ", ".join(f"p{x['slide']}:「{x['match'][:28]}」" for x in f["long_modifier_hits"][:4])
+        lines.append(f"⚠ [S12/D2 长定语绕口句预警] ({len(f['long_modifier_hits'])}处)：{sample_lm}")
     if f["unhuman_urls_or_syntax"]:
         sample_u = ", ".join(f"p{x['slide']}({x['where']}):{x['match'][:40]}" for x in f["unhuman_urls_or_syntax"][:4])
         lines.append(f"⚠ [S11/V3 非人链接或检索源码] ({len(f['unhuman_urls_or_syntax'])}处)：{sample_u}")
@@ -787,10 +856,10 @@ def assess(record: dict, rubric: dict) -> dict:
         if st is None or not ev_ok:
             pending.append(f"vetoes.{vid}")
 
-    # 2. Signals (S1-S11)
+    # 2. Signals (S1-S12)
     signals_raw = _check_dict(record.get("signals", {}), "signals", set(rubric["signals"]))
     s1_6_red = []
-    s7_11_red = []
+    s7_12_red = []
     s_mild = []
     for sid, sdef in rubric["signals"].items():
         sobj = _check_dict(signals_raw.get(sid, {}), f"signals.{sid}")
@@ -805,7 +874,7 @@ def assess(record: dict, rubric: dict) -> dict:
             if sdef["category"] == "process":
                 s1_6_red.append({"id": sid, "title": sdef["title"], "evidence": sobj.get("evidence", "").strip()})
             else:
-                s7_11_red.append({"id": sid, "title": sdef["title"], "evidence": sobj.get("evidence", "").strip()})
+                s7_12_red.append({"id": sid, "title": sdef["title"], "evidence": sobj.get("evidence", "").strip()})
         elif lvl == 1:
             s_mild.append(sid)
 
@@ -921,7 +990,7 @@ def assess(record: dict, rubric: dict) -> dict:
         for d in "ABCDEFGH"
     }
 
-    # 6. Tier & Target verdict (identical to Excel v2.2 formulas!)
+    # 6. Tier & Target verdict (identical to Excel v2.3 formulas!)
     if blocked_vetoes:
         tier = "D 级｜阻断交付"
         target_met = "阻断未达标"
@@ -936,17 +1005,17 @@ def assess(record: dict, rubric: dict) -> dict:
         and anti_ai_score >= 85
         and len(zero_overall) == 0
         and len(zero_pages) <= zero_page_limit
-        and len(s1_6_red) + len(s7_11_red) == 0
+        and len(s1_6_red) + len(s7_12_red) == 0
     ):
         tier = "S 级｜优秀手工标杆"
         req_aai = 85 if float(target) >= 88 else min(float(target), 72)
         target_met = "达到修订目标" if (total_score >= float(target) and anti_ai_score >= req_aai) else "未达目标"
-    elif total_score >= 75 and anti_ai_score >= 72 and len(s1_6_red) == 0 and len(s7_11_red) <= 1:
+    elif total_score >= 75 and anti_ai_score >= 72 and len(s1_6_red) == 0 and len(s7_12_red) <= 1:
         tier = "A 级｜良好手工级"
         req_aai = 85 if float(target) >= 88 else min(float(target), 72)
         target_met = (
             "达到修订目标"
-            if (total_score >= float(target) and anti_ai_score >= req_aai and len(zero_overall) == 0 and len(s1_6_red) + len(s7_11_red) == 0)
+            if (total_score >= float(target) and anti_ai_score >= req_aai and len(zero_overall) == 0 and len(s1_6_red) + len(s7_12_red) == 0)
             else "未达目标"
         )
     else:
@@ -957,7 +1026,7 @@ def assess(record: dict, rubric: dict) -> dict:
     fix_queue = []
     for bv in blocked_vetoes:
         fix_queue.append({"priority": "P0-否决阻断", "target": bv["id"], "detail": bv["evidence"]})
-    for sr in s1_6_red + s7_11_red:
+    for sr in s1_6_red + s7_12_red:
         fix_queue.append({"priority": "P1-红灯指纹", "target": f"{sr['id']} {sr['title']}", "detail": sr["evidence"]})
     for code in zero_overall:
         fix_queue.append({"priority": "P2-整稿0分", "target": f"{code} {criteria[code]['title']}", "detail": overall_raw[code].get("evidence", "").strip()})
@@ -993,7 +1062,7 @@ def assess(record: dict, rubric: dict) -> dict:
         "dim_scores": dim_scores,
         "blocked_vetoes": [v["id"] for v in blocked_vetoes],
         "s1_6_red": [s["id"] for s in s1_6_red],
-        "s7_11_red": [s["id"] for s in s7_11_red],
+        "s7_12_red": [s["id"] for s in s7_12_red],
         "s_mild": s_mild,
         "zero_overall": zero_overall,
         "zero_pages": zero_pages,
@@ -1014,7 +1083,7 @@ def format_score_summary(res: dict) -> str:
         f"综合档位：{res['tier']} | 修订目标({res['target']})：{res['target_met']}",
         f"整体得分：{res['total_score']}（适用权 {res['applicable_weight']}）| 去 AI 味指数：{res['anti_ai_score']}（去AI权 {res['anti_ai_weight']}）",
         "八维分：" + " ".join(f"{k}={v}" for k, v in res["dim_scores"].items() if v is not None),
-        f"否决阻断：{res['blocked_vetoes'] or '无'} | 工序红灯(S1-S6)：{res['s1_6_red'] or '无'} | AI味红灯(S7-S11)：{res['s7_11_red'] or '无'} | 整稿0分：{res['zero_overall'] or '无'} | 含0分页：{res['zero_pages'] or '无'} (上限{res['zero_page_limit']})",
+        f"否决阻断：{res['blocked_vetoes'] or '无'} | 工序红灯(S1-S6)：{res['s1_6_red'] or '无'} | AI味红灯(S7-S12)：{res.get('s7_12_red', res.get('s7_12_red')) or '无'} | 整稿0分：{res['zero_overall'] or '无'} | 含0分页：{res['zero_pages'] or '无'} (上限{res['zero_page_limit']})",
     ]
     for w in res["warnings"]:
         lines.append(f"⚠ {w}")
@@ -1060,8 +1129,8 @@ def diff_rounds(a: dict, b: dict) -> dict:
         "anti_ai_score": {"before": a["anti_ai_score"], "after": b["anti_ai_score"], "delta": delta(a["anti_ai_score"], b["anti_ai_score"])},
         "blocked_vetoes": {"before": a["blocked_vetoes"], "after": b["blocked_vetoes"]},
         "red_signals": {
-            "before": a["s1_6_red"] + a["s7_11_red"],
-            "after": b["s1_6_red"] + b["s7_11_red"],
+            "before": a["s1_6_red"] + a.get("s7_12_red", a.get("s7_12_red", [])),
+            "after": b["s1_6_red"] + b.get("s7_12_red", b.get("s7_12_red", [])),
         },
         "zero_overall": {"before": a["zero_overall"], "after": b["zero_overall"]},
         "zero_pages": {"before": a["zero_pages"], "after": b["zero_pages"]},
@@ -1071,18 +1140,18 @@ def diff_rounds(a: dict, b: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rubric", type=Path, default=RUBRIC_JSON, help="v2.2 量表 JSON 路径")
+    parser.add_argument("--rubric", type=Path, default=RUBRIC_JSON, help="v2.3 量表 JSON 路径")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_guide = sub.add_parser("guide", help="输出 v2.2 评分锚点、否决项与指纹规则")
+    p_guide = sub.add_parser("guide", help="输出 v2.3 评分锚点、否决项与指纹规则")
     p_guide.add_argument("--genre", help="按体裁过滤 H 项：01 / 02 / 03 / 04 / other")
     p_guide.add_argument("--format", choices=("md", "json"), default="md")
 
-    p_scan = sub.add_parser("scan", help="无依赖解析 .pptx XML 预检 S1–S11、嵌入链接、占位符与复读")
+    p_scan = sub.add_parser("scan", help="无依赖解析 .pptx XML 预检 S1–S12、嵌入链接、生造黑话、占位符与复读")
     p_scan.add_argument("pptx", type=Path, help="待检 .pptx 文件路径")
     p_scan.add_argument("-o", "--output", type=Path, help="完整预检结果写入 JSON 文件")
 
-    p_init = sub.add_parser("init", help="建立一轮 v2.2 空评审记录 JSON")
+    p_init = sub.add_parser("init", help="建立一轮 v2.3 空评审记录 JSON")
     p_init.add_argument("--deck", required=True, help="稿件名或版本号")
     p_init.add_argument("--genre", required=True, help="体裁：01 / 02 / 03 / 04 / other")
     p_init.add_argument("--pages", type=int, required=True, help="本次评审页数（全评或抽检页数）")
@@ -1124,7 +1193,7 @@ def main() -> int:
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 args.output.write_text(txt, encoding="utf-8")
-                print(f"已创建 v2.2 评审模板：{args.output}（体裁 {rec['genre_label']}，{rec['page_count']} 页）")
+                print(f"已创建 {rubric['version']} 评审模板：{args.output}（体裁 {rec['genre_label']}，{rec['page_count']} 页）")
             else:
                 print(txt)
         elif args.cmd == "score":
